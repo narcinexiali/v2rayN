@@ -132,8 +132,10 @@ public class SpeedtestService(Config config, Func<SpeedTestResult, Task> updateF
     private async Task<List<ServerTestItem>> GetClearItem(ESpeedActionType actionType, List<ProfileItem> selecteds)
     {
         var lstSelected = new List<ServerTestItem>(selecteds.Count);
+        // ponytail: Custom has no Address/Port (filename in Address); Tcping still skips it, real-delay paths include it.
+        var skipCustom = actionType == ESpeedActionType.Tcping;
         var ids = selecteds.Where(it => !it.IndexId.IsNullOrEmpty()
-            && it.ConfigType != EConfigType.Custom
+            && (!skipCustom || it.ConfigType != EConfigType.Custom)
             && (it.ConfigType.IsComplexType() || it.Port > 0))
             .Select(it => it.IndexId)
             .ToList();
@@ -141,7 +143,7 @@ public class SpeedtestService(Config config, Func<SpeedTestResult, Task> updateF
         for (var i = 0; i < selecteds.Count; i++)
         {
             var it = selecteds[i];
-            if (it.ConfigType == EConfigType.Custom)
+            if (skipCustom && it.ConfigType == EConfigType.Custom)
             {
                 continue;
             }
@@ -241,6 +243,17 @@ public class SpeedtestService(Config config, Func<SpeedTestResult, Task> updateF
     private async Task RunRealPingBatchAsync(List<ServerTestItem> lstSelected,
         ConcurrentDictionary<string, byte> completedIds, int pageSize = 0, CancellationToken ct = default)
     {
+        // ponytail: full custom configs can't share one batch core; test them one-by-one.
+        var customs = lstSelected.Where(t => t.ConfigType == EConfigType.Custom).ToList();
+        if (customs.Count > 0)
+        {
+            await RunMixedTestAsync(customs, completedIds, _config.SpeedTestItem.MixedConcurrencyCount, false, ct);
+            lstSelected = lstSelected.Where(t => t.ConfigType != EConfigType.Custom).ToList();
+            if (lstSelected.Count == 0)
+            {
+                return;
+            }
+        }
         if (pageSize <= 0)
         {
             pageSize = Math.Min(lstSelected.Count, _speedTestPageSize);
@@ -340,6 +353,17 @@ public class SpeedtestService(Config config, Func<SpeedTestResult, Task> updateF
     private async Task RunUdpTestBatchAsync(List<ServerTestItem> lstSelected,
         ConcurrentDictionary<string, byte> completedIds, int pageSize = 0, CancellationToken ct = default)
     {
+        // ponytail: same as realping, customs run solo.
+        var customs = lstSelected.Where(t => t.ConfigType == EConfigType.Custom).ToList();
+        if (customs.Count > 0)
+        {
+            await RunCustomUdpTestAsync(customs, completedIds, ct);
+            lstSelected = lstSelected.Where(t => t.ConfigType != EConfigType.Custom).ToList();
+            if (lstSelected.Count == 0)
+            {
+                return;
+            }
+        }
         if (pageSize <= 0)
         {
             pageSize = Math.Min(lstSelected.Count, _speedTestPageSize);
@@ -426,6 +450,42 @@ public class SpeedtestService(Config config, Func<SpeedTestResult, Task> updateF
             }
         }
         return true;
+    }
+
+    private async Task RunCustomUdpTestAsync(List<ServerTestItem> customs,
+        ConcurrentDictionary<string, byte> completedIds, CancellationToken ct = default)
+    {
+        foreach (var it in customs)
+        {
+            ct.ThrowIfCancellationRequested();
+            ProcessService? processService = null;
+            try
+            {
+                processService = await CoreManager.Instance.LoadCoreConfigSpeedtest(it);
+                if (processService is null)
+                {
+                    await UpdateFunc(it.IndexId, ResUI.FailedToRunCore);
+                    continue;
+                }
+                await Task.Delay(1000, ct);
+                await DoUdpTest(it, completedIds, ct);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                Logging.SaveLog(_tag, ex);
+            }
+            finally
+            {
+                if (processService != null)
+                {
+                    await processService.StopAsync();
+                }
+            }
+        }
     }
 
     private async Task RunMixedTestAsync(List<ServerTestItem> selecteds,
